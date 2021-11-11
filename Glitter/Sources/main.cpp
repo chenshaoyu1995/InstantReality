@@ -38,10 +38,11 @@ typedef Array<std::complex<float>, Dynamic, Dynamic, RowMajor> Array_complex;
 typedef std::tuple<float, int, int> queue_t; // (weight, index, LOD)
 typedef std::tuple<size_t, size_t, size_t, size_t> edge_t; // (tri_id1, tri_idx1, tri_id2, tri_idx2) of an edge 
 
-const float LOD2TESLEVEL[3] = { 1,4,32 };
-const int NUMLOD = 2;
-const int BUDGET = 5000;
-const int LODCOST[2] = { 16,168 };
+const float UPDATEINTERVAL = 0.2f;
+const float LOD2TESLEVEL[5] = { 1,2,4,8,16 };
+const int NUMLOD = 4;
+const int BUDGET = 200;
+const int LODCOST[4] = { 4,12,24,48 };
 
 const float LAMBDA = 3.0f;
 const float ECCOFFSET = 2.0f;
@@ -66,22 +67,19 @@ public:
 		mWindow = window;
 		glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 		glfwWindowHint(GLFW_CONTEXT_RELEASE_BEHAVIOR, GLFW_RELEASE_BEHAVIOR_NONE);
-		mBGWindow = glfwCreateWindow(1, 1, "", NULL, mWindow);
-		create_task([&] {
-			glfwMakeContextCurrent(mBGWindow);
-			glGenFramebuffers(1, &mBGFBO);
-			glPixelStorei(GL_PACK_ALIGNMENT, 1);
-			glfwMakeContextCurrent(NULL);
-		});
 
 		// Setup background
-		mSkyShader.attach("background.vert").attach("background.frag").link();
-		mSkybox = std::shared_ptr<Mesh>(new TexMesh("viking/viking-rotated.obj"));
+		mSkyShader.attach("skybox.vert").attach("skybox.frag").link();
+		mSkybox = std::shared_ptr<Mesh>(new TexMesh("terrain/skybox_top.obj"));
+		mSkybox->mSubMeshes.push_back(std::shared_ptr<Mesh>(new TexMesh("terrain/skybox_right.obj"))->mSubMeshes[0]);
+		mSkybox->mSubMeshes.push_back(std::shared_ptr<Mesh>(new TexMesh("terrain/skybox_front.obj"))->mSubMeshes[0]);
+		mSkybox->mSubMeshes.push_back(std::shared_ptr<Mesh>(new TexMesh("terrain/skybox_left.obj"))->mSubMeshes[0]);
+		mSkybox->mSubMeshes.push_back(std::shared_ptr<Mesh>(new TexMesh("terrain/skybox_back.obj"))->mSubMeshes[0]);
 
 		// Setup mesh
 		mShader.attach("tessellation.vert").attach("tessellation.tcs").attach("tessellation.tes").attach("tessellation.frag").link().activate().bind("showGaze", 0);
-		mObject = std::shared_ptr<Mesh>(new TessellationMesh("cman/cman.obj"));
-		mShader.bind("displacementCof", 0.0f).bind("hasNormalMap", 0).bind("worldLightDir", glm::vec3({ 0.0, 1.0, 2.0 })).bind("diffuseOffset", 0.2f).bind("specularCoeff", 0.2f);
+		mObject = std::shared_ptr<Mesh>(new TessellationMesh("terrain/plane.obj"));
+		mShader.bind("displacementCof", 10.0f).bind("worldLightDir", glm::vec3({ 0.0, 1.0, -2.0 })).bind("diffuseOffset", 0.4f).bind("specularCoeff", 0.2f).bind("hasNormalMap", true).bind("hasEmiss", false).bind("hasSpec", false);
 
 		std::dynamic_pointer_cast<TessellationMesh>(mObject)->mShader = &mShader;
 		NUMFACES = mObject->getObjectNum();
@@ -99,7 +97,6 @@ public:
 		}
 		InitFrameBuffer(mFBO, mFBOTex, 3, mWidth * 2, mHeight * 2);
 		InitFrameBuffer(mResizeFBO, mResizeFBOTex, 3, mWidth, mHeight);
-		for (int i = 0; i < NUMLOD + 1; ++i) InitFrameBuffer(mPopFBO[i], mPopFBOTex[i], 3, mWidth, mHeight);
 
 		// Setup members for popping calculation
 		InitPoppingCaculation();
@@ -117,6 +114,11 @@ public:
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		std::dynamic_pointer_cast<TessellationMesh>(mObject->mSubMeshes[0])->SetupTesBuffer(mFaceTesBuffer, mEdgeTesBuffer);
 		mEdgePair = CalculateEdgePair(mObject->mSubMeshes[0]->mIndices, mObject->mSubMeshes[0]->mVertices.size());
+
+		socket.bind("tcp://*:5555");
+
+		std::string filename = PROJECT_SOURCE_DIR "/Glitter/Assets/mask.dat";
+		ReadMatrix(filename, mEccMask);
 	}
 
 	void Render() {
@@ -173,7 +175,10 @@ public:
 		RenderToScreen();
 
 		if (flag && !mBGWorking && !mBGUpdate) {
-			CalculatePopping(mIsSaccade);
+			if (mSystemTimestamp > mUpdateTimestamp + UPDATEINTERVAL) {
+				mUpdateTimestamp += UPDATEINTERVAL;
+				CalculatePopping(mIsSaccade);
+			}
 		} else if (mBGUpdate) {
 			mFaceLOD = std::move(mNewLOD);
 			// Update tessellation level
@@ -207,11 +212,19 @@ public:
 	}
 
 	void KeyCallBack(int key, int scancode, int action, int mods) {
+		const static auto targetEye = glm::vec3({ 0.05, 2.90, 7.47 });
 		if (action == GLFW_PRESS) {
 			switch (key)
 			{
 			case GLFW_KEY_Q:
 				flag = true;
+				mUpdateTimestamp = mSystemTimestamp + UPDATEINTERVAL;
+
+				auto inv = glm::inverse(enableVR ? vr.getMatrixPoseEye(vr::Eye_Right) * mViewMatrix : mViewMatrix);
+				auto eye = inv * glm::vec4{ 0,0,0,1 };
+				auto diff = targetEye - glm::vec3(eye);
+				mEye += diff; mLookAt += diff;
+
 				break;
 			default:
 				break;
@@ -223,15 +236,6 @@ public:
 		mBGWorking = true;
 		auto t = glfwGetTime();
 
-		// Render for each possible LOD
-		for (int i = 1; i <= 1 + NUMLOD; ++i) {
-			mObject->setUnifromLOD((float)LOD2TESLEVEL[i - 1]);
-			glBindFramebuffer(GL_FRAMEBUFFER, mPopFBO[i - 1]);
-			glViewport(0, 0, mWidth, mHeight);
-			RenderImage();
-		}
-		mObject->setUnifromLOD(0);
-
 		// Readback user's view
 		if constexpr (enableVR) glBindFramebuffer(GL_READ_FRAMEBUFFER, m_rightFbo);
 		else glBindFramebuffer(GL_READ_FRAMEBUFFER, mFBO);
@@ -239,41 +243,55 @@ public:
 		glReadBuffer(GL_COLOR_ATTACHMENT1);
 		glDrawBuffer(GL_COLOR_ATTACHMENT1);
 		glBlitFramebuffer(0, 0, mWidth * 2, mHeight * 2, 0, 0, mWidth, mHeight, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		glReadBuffer(GL_COLOR_ATTACHMENT2);
-		glDrawBuffer(GL_COLOR_ATTACHMENT2);
-		glBlitFramebuffer(0, 0, mWidth * 2, mHeight * 2, 0, 0, mWidth, mHeight, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, mResizeFBO);
 		glReadBuffer(GL_COLOR_ATTACHMENT1);
 		glReadPixels(0, 0, mWidth, mHeight, GL_RED, GL_UNSIGNED_BYTE, mCurrId0.data());
 		glReadPixels(0, 0, mWidth, mHeight, GL_GREEN, GL_UNSIGNED_BYTE, mCurrId1.data());
-		glReadBuffer(GL_COLOR_ATTACHMENT2);
-		glReadPixels(0, 0, mWidth, mHeight, GL_RED, GL_FLOAT, mCurrEcc.data());
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+		auto gaze = mGaze;
+		auto inv = glm::inverse(enableVR ? vr.getMatrixPoseEye(vr::Eye_Right) * mViewMatrix : mViewMatrix);
+		auto eye = inv * glm::vec4{ 0,0,0,1 };
+		auto lookat = inv * glm::vec4{ 0,0,-1,0 };
+		auto up = inv * glm::vec4{ 0,1,0,0 };
 
-		create_task([this, isSaccade, t] {
-			glfwMakeContextCurrent(mBGWindow);
-			// Readback for each possible LOD
-			glBindFramebuffer(GL_FRAMEBUFFER, mBGFBO);
-			for (int i = 0; i < 1 + NUMLOD; ++i) {
-				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mPopFBOTex[i][1], 0);
-				glReadBuffer(GL_COLOR_ATTACHMENT0);
-				glReadPixels(0, 0, mWidth, mHeight, GL_BLUE, GL_UNSIGNED_BYTE, mImage[i].data());
-			}
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
+		create_task([this, isSaccade, gaze, eye, lookat, up, t] {
 			// Ecc importance for user's view
+			auto coord = GazeToMouse(gaze);
+			auto currEcc = mEccMask.block(mHeight - (int)roundf(coord.y), mWidth - (int)roundf(coord.x) + 40, mHeight, mWidth);
+
 			mCurrId = mCurrId0.cast<unsigned int>() + mCurrId1.cast<unsigned int>() * 256;
+			mCount = 0;
 			mTriEcc = 0;
 			for (size_t i = 0; i < mHeight; ++i) {
 				for (size_t j = 0; j < mWidth; ++j) {
-					mTriEcc[mCurrId(i, j)] += mCurrEcc(i, j) + ECCOFFSET;
+					mTriEcc[mCurrId(i, j)] += currEcc(i, j) + ECCOFFSET;
+					mCount[mCurrId(i, j)]++;
 				}
 			}
+			mCount[0] = 0;
 			mTriEcc[0] = 0;
 
-			FFTCalculation(isSaccade);
+			// read from NN
+			json nnInput;
+			nnInput["eye"] = { eye[0], eye[1],eye[2] };
+			nnInput["lookat"] = { lookat[0], lookat[1],lookat[2] };
+			nnInput["up"] = { up[0], up[1], up[2] };
+			nnInput["gaze"] = { gaze[0],gaze[1],gaze[2] };
+			nnInput["isSaccade"] = (int)isSaccade;
+
+			socket.send(zmq::buffer(nnInput.dump()), zmq::send_flags::none);
+			zmq::message_t request;
+			socket.recv(request, zmq::recv_flags::none);
+			json reply = json::parse(request.to_string());
+
+			for (int l = 0; l < NUMLOD; ++l) {
+				auto jsonTriPopping = reply[std::to_string(l)];
+				std::copy(jsonTriPopping.begin(), jsonTriPopping.end(), mTriPopping[l].begin());
+				mTriPopping[l] *= 100.0f * mCount.cast<float>();
+			}
+
 
 			// Initialize heap
 			std::vector<queue_t> container;
@@ -282,9 +300,7 @@ public:
 				if (lod < NUMLOD && mTriEcc[idx] != 0) container.emplace_back(GetWeight(idx, lod, isSaccade), idx, lod + 1);
 			}
 			if (container.empty()) {
-				flag = false;
 				mBGWorking = false;
-				glfwMakeContextCurrent(NULL);
 				return;
 			}
 			std::priority_queue<queue_t> heap(std::less<queue_t>(), std::move(container));
@@ -306,7 +322,6 @@ public:
 			std::cout << glfwGetTime() - t << std::endl;
 			mBGUpdate = true;
 			mBGWorking = false;
-			glfwMakeContextCurrent(NULL);
 		});
 	}
 
@@ -352,11 +367,9 @@ public:
 		mCurrId = Array_ui(mHeight, mWidth);
 		mCurrId0 = Array_ub(mHeight, mWidth);
 		mCurrId1 = Array_ub(mHeight, mWidth);
-		mCurrEcc = Array_t(mHeight, mWidth);
 		mTriEcc = ArrayXf(NUMFACES);
+		mCount = ArrayXf(NUMFACES);
 		mTriPopping = std::vector<ArrayXf>(NUMLOD, ArrayXf(NUMFACES));
-		mTriPoppingNomask = std::vector<ArrayXf>(NUMLOD, ArrayXf(NUMFACES));
-		InitFFT();
 	}
 
 	std::vector<edge_t> CalculateEdgePair(const std::vector<GLuint>& indices, size_t numVert) {
@@ -402,117 +415,6 @@ public:
 		}
 
 		return edgePair;
-	}
-
-	void FFTCalculation(bool isSaccade) {
-		// ID and FFT
-		parallel_for(0, NUMLOD + 1, [&](int l) {
-			mIn[l] = mImage[l].cast<float>();
-			fftwf_execute(mPlan[l]);
-		});
-
-		// Bandpass
-		parallel_for(0, (NUMLOD + 1) * (int)mFreq.size(), [&](int i) {
-			auto lod = i / mFreq.size();
-			auto freqIdx = i % mFreq.size();
-
-			mRIn[i] = mOut[lod] * mAFFilter[freqIdx];
-			fftwf_execute(mRPlan[i]);
-			mContrastIm[i] = mROut[i] / (mWidth * mHeight);
-
-			mRIn[i] = mOut[lod] * mLFFilter[freqIdx];
-			fftwf_execute(mRPlan[i]);
-			mContrastIm[i] = mContrastIm[i] / (mROut[i] / (mWidth * mHeight)).max(0.1f) * mFreqSensitivity[freqIdx];
-			if (!isSaccade)mContrastIm[i] = (mCurrEcc < (mFreq[freqIdx] / FOV)).select(0, mContrastIm[i]);
-		});
-
-		// Popping
-		parallel_for(0, NUMLOD, [&](int l) {
-			mPopping[l] = 0;
-			for (int i = 0; i < mFreq.size(); ++i) {
-				auto& m1 = mContrastIm[i + l * mFreq.size()];
-				auto& m2 = mContrastIm[i + (l + 1) * mFreq.size()];
-				mPopping[l] += abs(m1 - m2) / (abs(m1) + 10);
-			}
-		});
-
-		// Assign to triangle by ID
-		parallel_for(0, NUMLOD, [&](int l) {
-			auto& triPopping = mTriPopping[l];
-			triPopping = 0;
-			for (size_t i = 0; i < mHeight; ++i) {
-				for (size_t j = 0; j < mWidth; ++j) {
-					triPopping[mCurrId(i, j)] += mPopping[l](i, j);
-				}
-			}
-			triPopping[0] = 0;
-		});
-	}
-
-	Array_t GenerateAF(float F) {
-		auto norX = (float)mWidth / mHeight;
-		auto norY = (float)mHeight / mHeight;
-
-		Array<float, 1, Dynamic> x = Array<float, 1, Dynamic>::LinSpaced(mWidth / 2 + 1, 0, norX).square();
-		Array<float, Dynamic, 1> y(mHeight);
-		y.head(mHeight / 2 + 1) = Array<float, 1, Dynamic>::LinSpaced(mHeight / 2 + 1, 0, norY);
-		y.tail(mHeight / 2) = Array<float, 1, Dynamic>::LinSpaced(mHeight / 2 + 1, norY, 0).head(mHeight / 2);
-		y = y.square();
-
-		auto meshgrid = (x.replicate(mHeight, 1) + y.replicate(1, mWidth / 2 + 1)).sqrt();
-		Array_t filter = exp(-(meshgrid - F).square() / (2 * 0.3 * F * 0.3 * F));
-		return filter;
-	}
-
-	Array_t GenerateLF(float F) {
-		auto norX = (float)mWidth / mHeight;
-		auto norY = (float)mHeight / mHeight;
-
-		Array<float, 1, Dynamic> x = Array<float, 1, Dynamic>::LinSpaced(mWidth / 2 + 1, 0, norX).square();
-		Array<float, Dynamic, 1> y(mHeight);
-		y.head(mHeight / 2 + 1) = Array<float, 1, Dynamic>::LinSpaced(mHeight / 2 + 1, 0, norY);
-		y.tail(mHeight / 2) = Array<float, 1, Dynamic>::LinSpaced(mHeight / 2 + 1, norY, 0).head(mHeight / 2);
-		y = y.square();
-
-		auto meshgrid = (x.replicate(mHeight, 1) + y.replicate(1, mWidth / 2 + 1)).sqrt();
-		Array_t filter = exp(-meshgrid.square() / (2 * 0.3 * F * 0.3 * F));
-		return filter;
-	}
-
-	void InitFFT() {
-		// Pre-compute frequency and sensitivity
-		const float L = 100.0;
-		const float X = 10.0;
-		const float b = 0.3 * pow(1 + 100 / L, 0.15);
-		const float c = 0.06;
-
-		auto s = [=](ArrayXf u) -> ArrayXf {
-			float a = 540.0 * pow(1 + 0.7 / L, -0.2);
-			auto aArray = a / (1 + 12 / (X * (1 + u / 3)));
-			return aArray * u * exp(-b * u) * sqrt(1 + c * exp(b * u));
-		};
-
-		mFreq = Array<float, 9, 1>({ 1,2,4,8,16,32,64,128,256 });
-		mFreqSensitivity = s(mFreq / FOV);
-
-		for (int i = 0; i < mFreq.size(); ++i) {
-			mAFFilter.push_back(GenerateAF(mFreq[i] / (mHeight / 2)));
-			mLFFilter.push_back(GenerateLF(mFreq[i] / (mHeight / 2)));
-		}
-
-		mImage = std::vector<Array_ub>(NUMLOD + 1, Array_ub(mHeight, mWidth));
-		mPopping = std::vector<Array_t>(NUMLOD, Array_t(mHeight, mWidth));
-		mPoppingNomask = std::vector<Array_t>(NUMLOD, Array_t(mHeight, mWidth));
-		mIn = std::vector<Array_t>(NUMLOD + 1, Array_t(mHeight, mWidth));
-		mOut = std::vector<Array_complex>(NUMLOD + 1, Array_complex(mHeight, mWidth / 2 + 1));
-		mPlan = std::vector<fftwf_plan>(NUMLOD + 1);
-		for (int i = 0; i < NUMLOD + 1; ++i) mPlan[i] = fftwf_plan_dft_r2c_2d(mHeight, mWidth, mIn[i].data(), fftwf_cast(mOut[i].data()), FFTW_MEASURE);
-		mRIn = std::vector<Array_complex>((NUMLOD + 1) * mFreq.size(), Array_complex(mHeight, mWidth / 2 + 1));
-		mROut = std::vector<Array_t>((NUMLOD + 1) * mFreq.size(), Array_t(mHeight, mWidth));
-		mRPlan = std::vector<fftwf_plan>((NUMLOD + 1) * mFreq.size());
-		for (int i = 0; i < (NUMLOD + 1) * mFreq.size(); ++i) mRPlan[i] = fftwf_plan_dft_c2r_2d(mHeight, mWidth, fftwf_cast(mRIn[i].data()), mROut[i].data(), FFTW_MEASURE);
-		mContrastIm = std::vector<Array_t>((NUMLOD + 1) * mFreq.size(), Array_t(mHeight, mWidth));
-		mContrastImNomask = std::vector<Array_t>((NUMLOD + 1) * mFreq.size(), Array_t(mHeight, mWidth));
 	}
 
 	// Helper functions
@@ -570,6 +472,19 @@ public:
 		return glm::normalize(dir);
 	}
 
+	glm::vec2 GazeToMouse(glm::vec3 gaze) {
+		gaze /= -gaze.z;
+		gaze /= tan(FOV / 2.0 / 180.0 * PI);
+
+		double y = mHeight * (1 + gaze.y) / 2;
+		double x = (mHeight * gaze.x + mWidth) / 2;
+
+		x = std::clamp(x, -40.0, (double)mWidth - 40.0);
+		y = std::clamp(y, 0.0, (double)mHeight);
+
+		return { x,y };
+	}
+
 	void ResetLOD() {
 		mUniformLODLevel = 0.0f;
 		mFaceLOD = std::vector<int>(NUMFACES, 0);
@@ -590,9 +505,9 @@ public:
 	glm::mat4 mViewProjectionMatrix;
 	glm::mat4 mViewMatrix;
 
-	glm::vec3 mEye = { -1.979,0,1.148 };
-	glm::vec3 mLookAt = { -1.272,0,0.4347 };
-	glm::vec3 mUp = {0,1,0};
+	glm::vec3 mEye = { 0,1.5,8 };
+	glm::vec3 mLookAt = { 0,0,0 };
+	glm::vec3 mUp = glm::cross({ 1,0,0 }, mLookAt - mEye);
 
 	// Objects and shaders
 	Shader mShader;
@@ -604,13 +519,10 @@ public:
 	// Framebuffers
 	GLuint mFBO;
 	GLuint mFBOTex[4];
-	GLuint mPopFBO[NUMLOD + 1];
-	GLuint mPopFBOTex[NUMLOD + 1][4];
 	GLuint m_leftFbo;
 	GLuint m_leftFboTex[4];
 	GLuint m_rightFbo;
 	GLuint m_rightFboTex[4];
-	GLuint mBGFBO;
 	GLuint mResizeFBO;
 	GLuint mResizeFBOTex[4];
 
@@ -618,26 +530,10 @@ public:
 	Array_ui mCurrId;
 	Array_ub mCurrId0;
 	Array_ub mCurrId1;
-	Array_t mCurrEcc;
+	Array_t mEccMask;
+	ArrayXf mCount;
 	ArrayXf mTriEcc;
 	std::vector<ArrayXf> mTriPopping;
-	std::vector<ArrayXf> mTriPoppingNomask;
-
-	ArrayXf mFreq;
-	ArrayXf mFreqSensitivity;
-	std::vector<Array_t> mAFFilter;
-	std::vector<Array_t> mLFFilter;
-	std::vector<Array_t> mPopping;
-	std::vector<Array_t> mPoppingNomask;
-	std::vector<Array_ub> mImage;
-	std::vector<Array_t> mIn;
-	std::vector<Array_complex> mOut;
-	std::vector<fftwf_plan> mPlan;
-	std::vector<Array_complex> mRIn;
-	std::vector<Array_t> mROut;
-	std::vector<fftwf_plan> mRPlan;
-	std::vector<Array_t> mContrastIm;
-	std::vector<Array_t> mContrastImNomask;
 
 	// Tessellation related
 	float mUniformLODLevel = 0.0f;
@@ -655,7 +551,6 @@ public:
 	// Multithread related
 	bool flag = false;
 	GLFWwindow* mWindow;
-	GLFWwindow* mBGWindow;
 	std::atomic<bool> mBGWorking = false;
 	std::atomic<bool> mBGUpdate = false;
 
@@ -664,8 +559,13 @@ public:
 	glm::vec3 mGaze = glm::vec3(0, 0, -1.0);
 	double mTimestamp = 0;
 	double mSystemTimestamp = 0;
+	double mUpdateTimestamp = 0;
 	double mSaccadeEndTime;
 	bool mIsSaccade = false;
+
+	//Network
+	zmq::context_t context{ 1 };
+	zmq::socket_t socket{ context, zmq::socket_type::req };
 };
 
 int main() {

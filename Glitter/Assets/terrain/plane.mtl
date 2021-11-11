@@ -1,0 +1,7 @@
+# Blender MTL File: 'None'
+# Material Count: 1
+
+newmtl None
+map_Kd QuantumHighlands_Diffuse_E.bmp
+map_Kn QuantumHighlands_Normal_E.bmp
+disp QuantumHighlands_Displacement_E.png
