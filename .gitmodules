@@ -1,0 +1,18 @@
+[submodule "Glitter/Vendor/assimp"]
+	path = Glitter/Vendor/assimp
+	url = https://github.com/assimp/assimp.git
+[submodule "Glitter/Vendor/glad"]
+	path = Glitter/Vendor/glad
+	url = https://github.com/Dav1dde/glad.git
+[submodule "Glitter/Vendor/glfw"]
+	path = Glitter/Vendor/glfw
+	url = https://github.com/glfw/glfw.git
+[submodule "Glitter/Vendor/glm"]
+	path = Glitter/Vendor/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "Glitter/Vendor/stb"]
+	path = Glitter/Vendor/stb
+	url = https://github.com/nothings/stb.git
+[submodule "Glitter/Vendor/eigen"]
+	path = Glitter/Vendor/eigen
+	url = https://gitlab.com/libeigen/eigen.git
