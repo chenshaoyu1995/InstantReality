@@ -1,4 +1,4 @@
-# Instant Reality: Gaze-Contingent Perceptual Optimization for 3D Immersive Streaming
+# Instant Reality: Gaze-Contingent Perceptual Optimization for 3D Virtual Reality Streaming
 
 This main branch demonstrates the computation pipeline of the proposed method without neural acceleration.
 
